@@ -189,20 +189,20 @@ class Engine:
         return min_free_memory, max_free_memory
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
-        assert torch.cuda.current_stream() == self.stream
-        with self.ctx.forward_batch(batch):
-            if self.graph_runner.can_use_cuda_graph(batch):
-                logits = self.graph_runner.replay(batch)
+        assert torch.cuda.current_stream() == self.stream       # CUDA 流校验,需要在调度流
+        with self.ctx.forward_batch(batch):                     # 通过全局上下文管理器绑定当前 batch 的元数据
+            if self.graph_runner.can_use_cuda_graph(batch):     # 判断当前 batch 是否满足图重放条件
+                logits = self.graph_runner.replay(batch)        # 前向：算出候选 token 的分数；重放预捕获的 CUDA 图以减少内核启动开销
             else:
                 logits = self.model.forward()
 
-        for req in batch.reqs:
+        for req in batch.reqs:          # 遍历当前批次中的所有请求，标记每个请求已完成一次前向推进
             req.complete_one()
 
-        next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
-        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
-        copy_done_event = torch.cuda.Event()
-        copy_done_event.record(self.stream)
+        next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)   # Token 采样：内部处理 softmax 和 token 选择
+        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)      # 将采样出的 token 异步拷贝到 CPU 内存
+        copy_done_event = torch.cuda.Event()        
+        copy_done_event.record(self.stream)         # 在当前 CUDA 流中插入一个事件标记
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     def shutdown(self) -> None:
