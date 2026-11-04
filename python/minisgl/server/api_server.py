@@ -112,24 +112,24 @@ class FrontendManager:
         self.ack_map[uid] = []
         self.event_map[uid] = asyncio.Event()
         return uid
-
+    # 后台常驻消息分发器
     async def listen(self):
         while True:
-            msg = await self.recv_tokenizer.get()
-            for msg in _unwrap_msg(msg):
-                if msg.uid not in self.ack_map:
+            msg = await self.recv_tokenizer.get()       # 从异步 ZMQ Pull 队列（ZmqAsyncPullQueue）中拉取后端发回的消息
+            for msg in _unwrap_msg(msg):                # 解包消息
+                if msg.uid not in self.ack_map:         # 安全过滤
                     continue
-                self.ack_map[msg.uid].append(msg)
-                self.event_map[msg.uid].set()
+                self.ack_map[msg.uid].append(msg)       # 将属于该 uid 的增量输出（UserReply）追加到该用户专属的缓冲列表中
+                self.event_map[msg.uid].set()           # 事件唤醒，唤醒在等这个结果的协程
 
     def _create_listener_once(self):
-        if not self.initialized:
+        if not self.initialized:                # 确保后台接收协程已经就绪
             asyncio.create_task(self.listen())
             self.initialized = True
 
     async def send_one(self, msg: BaseTokenizerMsg):
         self._create_listener_once()
-        await self.send_tokenizer.put(msg)
+        await self.send_tokenizer.put(msg)      # 将消息放入异步 ZMQ Push 队列（ZmqAsyncPushQueue），非阻塞地发送给后端进程
 
     async def wait_for_ack(self, uid: int):
         event = self.event_map[uid]
@@ -251,20 +251,20 @@ async def generate(req: GenerateRequest, request: Request):
 async def v1_root():
     return {"status": "ok"}
 
-
+# 定义了这是一个处理 HTTP POST 请求的端点，路径完全兼容 OpenAI 的官方 API 标准
 @app.post("/v1/chat/completions")
 async def v1_completions(req: OpenAICompletionRequest, request: Request):
-    state = get_global_state()
-    if req.messages:
+    state = get_global_state()      # 负责管理与后端（Tokenizer/推理引擎）的 ZeroMQ 异步通信以及管理当前所有活跃的请求
+    if req.messages:                # messages（Chat API 的标准做法，即包含了角色的对话历史）
         prompt = [msg.model_dump() for msg in req.messages]
     else:
         assert req.prompt is not None, "Either 'messages' or 'prompt' must be provided"
-        prompt = req.prompt
+        prompt = req.prompt         # 使用 req.prompt（普通的文本补全形式）
 
     # TODO: support more sampling parameters
-    uid = state.new_user()
+    uid = state.new_user()          # 为这个请求分配一个唯一的 uid，并在状态机中为其注册用于接收结果的事件
     await state.send_one(
-        TokenizeMsg(
+        TokenizeMsg(                # 将用户请求打包成一个 TokenizeMsg 消息
             uid=uid,
             text=prompt,
             sampling_params=SamplingParams(
@@ -276,16 +276,19 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             ),
         )
     )
-
-    if req.stream:
+    # 流式输出
+    if req.stream:  
         return StreamingResponse(
+            # stream_chat_completions 异步生成器，会不断监听后端传回来的数据块
+            # stream_with_cancellation 在推送数据的同时，时刻监控 request.is_disconnected() 向后端发送中止信号 (AbortMsg) 以节省算力
             state.stream_with_cancellation(state.stream_chat_completions(uid), request, uid),
             media_type="text/event-stream",
         )
-
+    # 非流式输出
     # Non-streaming: collect all chunks and return a single JSON response
     full_content = ""
     async for ack in state.wait_for_ack(uid):
+        # 每当后端生成出一个片段（ack.incremental_output），就将其拼接到 full_content 字符串中
         full_content += ack.incremental_output
         if ack.finished:
             break
