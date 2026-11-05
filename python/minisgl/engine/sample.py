@@ -44,15 +44,15 @@ def sample_impl(
     assert top_k is not None and top_p is not None
     return sampling.top_k_top_p_sampling_from_probs(probs, top_k, top_p)
 
-
+# 将批处理的请求参数转换为设备端（如 GPU）张量，并根据这些参数对模型的输出（Logits）执行具体的采样操作
 @dataclass
 class Sampler:
-    device: torch.device
-    vocab_size: int
+    device: torch.device        # 指定采样计算运行的设备
+    vocab_size: int             # 模型的词表大小，用于处理未指定 top_k 时的默认边界值
 
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
         params = [r.sampling_params for r in batch.reqs]
-        if all(p.is_greedy for p in params):
+        if all(p.is_greedy for p in params):                # 检查批次中是否所有请求都采用贪心采样
             return BatchSamplingArgs(temperatures=None)
 
         MIN_P = MIN_T = 1e-6
