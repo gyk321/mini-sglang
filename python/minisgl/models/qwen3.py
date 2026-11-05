@@ -17,49 +17,49 @@ if TYPE_CHECKING:
 
 class Qwen3DecoderLayer(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int):
-        self.self_attn = Qwen3Attn(config, layer_id, has_qk_norm=True)
-        self.mlp = Qwen3MLP(config)
-        self.input_layernorm = RMSNormFused(
+        self.self_attn = Qwen3Attn(config, layer_id, has_qk_norm=True)      # 自注意力模块
+        self.mlp = Qwen3MLP(config)                     # 前馈神经网络模块
+        self.input_layernorm = RMSNormFused(            # 注意力层之前的均方根归一化层
             size=config.hidden_size,
             eps=config.rms_norm_eps,
         )
-        self.post_attention_layernorm = RMSNormFused(
+        self.post_attention_layernorm = RMSNormFused(   # MLP 层之前的均方根归一化层
             size=config.hidden_size,
             eps=config.rms_norm_eps,
         )
 
-        self._layer_id = layer_id
+        self._layer_id = layer_id                       # 记录当前层的编号，供性能分析工具使用
 
-    @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
+    @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")                  # 方便开发者在使用 Nsight Systems 等工具进行 GPU 性能剖析
     def forward(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x, residual = self.input_layernorm.forward(x, residual)
+        x, residual = self.input_layernorm.forward(x, residual)             # 注意力前归一化与残差融合
         x = self.self_attn.forward(x)
-        x, residual = self.post_attention_layernorm.forward(x, residual)
-        x = self.mlp.forward(x)
-        return x, residual
+        x, residual = self.post_attention_layernorm.forward(x, residual)    # MLP 前归一化与残差融合
+        x = self.mlp.forward(x)                                             # 前馈网络计算
+        return x, residual  
 
 
 class Qwen3Model(BaseOP):
     def __init__(self, config: ModelConfig):
-        self.embed_tokens = VocabParallelEmbedding(
+        self.embed_tokens = VocabParallelEmbedding(     # 词嵌入层
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
         )
-        self.layers = OPList(
+        self.layers = OPList(                           # 解码器层列表
             [Qwen3DecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
         )
-        self.norm = RMSNormFused(
+        self.norm = RMSNormFused(                       # 最终归一化层
             size=config.hidden_size,
             eps=config.rms_norm_eps,
         )
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.embed_tokens.forward(input_ids)
-        residual: torch.Tensor | None = None
+        x = self.embed_tokens.forward(input_ids)        # 将输入的张量（包含 token IDs）通过词嵌入层转换为初始的隐藏状态张量
+        residual: torch.Tensor | None = None            # 残差连接初始化
         for layer in self.layers.op_list:
-            x, residual = layer.forward(x, residual)
+            x, residual = layer.forward(x, residual)    # 依次穿过每一层解码器,不断更新当前的特征状态和残差
         return self.norm.forward(x, residual)[0]
 
 
