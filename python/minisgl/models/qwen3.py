@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 class Qwen3DecoderLayer(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int):
+        # 初始化解码器层
         self.self_attn = Qwen3Attn(config, layer_id, has_qk_norm=True)      # 自注意力模块
         self.mlp = Qwen3MLP(config)                     # 前馈神经网络模块
         self.input_layernorm = RMSNormFused(            # 注意力层之前的均方根归一化层
@@ -66,16 +67,20 @@ class Qwen3Model(BaseOP):
 class Qwen3ForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
         self.model = Qwen3Model(config)
-        self.lm_head = ParallelLMHead(
+        self.lm_head = ParallelLMHead(                          # 并行输出头
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
-            tie_word_embeddings=config.tie_word_embeddings,
+            tie_word_embeddings=config.tie_word_embeddings,     # 词嵌入权重共享
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
         )
         super().__init__()
 
     def forward(self) -> torch.Tensor:
+        # 从推理引擎的全局执行上下文（Global Context）中提取当前批次的 Token ID
+        # 便于统一管理连续批处理（Continuous Batching）、KV Cache 页表和 CUDA Graph 捕获。
         output = self.model.forward(get_global_ctx().batch.input_ids)
+
+        # 计算并返回未归一化的词表预测得分 logits
         logits = self.lm_head.forward(output)
         return logits
 
