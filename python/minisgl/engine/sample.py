@@ -51,14 +51,15 @@ class Sampler:
     vocab_size: int             # 模型的词表大小，用于处理未指定 top_k 时的默认边界值
 
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
-        params = [r.sampling_params for r in batch.reqs]
+        params = [r.sampling_params for r in batch.reqs]    # 从批次中的每个请求（batch.reqs）提取采样配置
         if all(p.is_greedy for p in params):                # 检查批次中是否所有请求都采用贪心采样
             return BatchSamplingArgs(temperatures=None)
 
         MIN_P = MIN_T = 1e-6
         ts = [max(0.0 if p.is_greedy else p.temperature, MIN_T) for p in params]
+        # 处理 top_k 参数，如果未指定则使用默认值（词表大小）
         top_ks = [p.top_k if p.top_k >= 1 else self.vocab_size for p in params]
-        top_ps = [min(max(p.top_p, MIN_P), 1.0) for p in params]
+        top_ps = [min(max(p.top_p, MIN_P), 1.0) for p in params]    # 将 top_p 的值严格限制在 [1e-6, 1.0] 的区间内
         temperatures = make_device_tensor(ts, torch.float32, self.device)
         top_k, top_p = None, None
         if any(k != self.vocab_size for k in top_ks):
