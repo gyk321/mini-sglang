@@ -50,16 +50,18 @@ def find_printable_text(text: str):
     else:
         return text[: text.rfind(" ") + 1]
 
-
+# DetokenizeManager 通过维护滑动上下文窗口解决了子词上下文丢失（前缀空格问题）和多字节 UTF-8 字符截断（乱码问题）
 @dataclass
 class DecodeStatus:
-    decoded_ids: List[int]
-    decoded_str: str
-    read_offset: int  # length of read ids
-    surr_offset: int  # length of surr ids
-    sent_offset: int  # length of sent out string
+    decoded_ids: List[int]          # 当前请求已生成的所有 token ID 列表
+    decoded_str: str                # 已经确认完整且无乱码的累计解码字符串
+    read_offset: int  # length of read ids          上一次成功完成完整字符解码时的 decoded_ids 长度
+    surr_offset: int  # length of surr ids          用来提供解码前缀，防止丢失前导空格
+    sent_offset: int  # length of sent out string   已经发送给客户端的字符串长度
 
-
+# 流式增量解码（Incremental Detokenization）的核心管理类
+# 在大模型逐个生成 token 的过程中，将 token ID 实时、准确地转换为可读文本，
+# 同时妥善处理子词拼接空格（如 SentencePiece 的前导空格）和多字节 UTF-8 字符（如中文、Emoji）被截断的问题
 class DetokenizeManager:
     def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
         # uid -> DecodeStatus
@@ -70,8 +72,8 @@ class DetokenizeManager:
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
-        for msg in msgs:
-            if msg.uid not in self.decode_map:
+        for msg in msgs:                            # 遍历传入的请求消息列表
+            if msg.uid not in self.decode_map:      # 遇到新的请求
                 self.decode_map[msg.uid] = DecodeStatus(
                     decoded_ids=[],
                     decoded_str="",
@@ -82,27 +84,29 @@ class DetokenizeManager:
             s = self.decode_map[msg.uid]
             if not (msg.finished and msg.next_token == self.eos_token_id):
                 s.decoded_ids.append(msg.next_token)
-            read_ids.append(s.decoded_ids[s.surr_offset :])
-            surr_ids.append(s.decoded_ids[s.surr_offset : s.read_offset])
+            read_ids.append(s.decoded_ids[s.surr_offset :])                 # 当前待解码整体
+            surr_ids.append(s.decoded_ids[s.surr_offset : s.read_offset])   # 上下文前缀:代表已经确认解码成功的一小段历史 token
 
+        # 利用 HuggingFace tokenizer 的 batch_decode，一次性将所有请求的 read_ids 和 surr_ids 转换为字符串
         read_texts = self.tokenizer.batch_decode(read_ids)
         surr_texts = self.tokenizer.batch_decode(surr_ids)
 
         incremental_strs: List[str] = []
         for msg, read_str, surr_str in zip(msgs, read_texts, surr_texts, strict=True):
             s = self.decode_map[msg.uid]
+            # 通过字符串相减（去掉历史前缀的字符串 surr_str），提取出真正属于本次新生成的文本
             new_text = read_str[len(surr_str) :]
             # Streaming chunk: update the decode status
-            if len(new_text) > 0 and not new_text.endswith("�"):
+            if len(new_text) > 0 and not new_text.endswith("�"):        # 完整无截断，新文本不以未知字符 `` 结尾
                 output_str = s.decoded_str + new_text
                 s.decoded_str = output_str
                 s.surr_offset = s.read_offset
                 s.read_offset = len(s.decoded_ids)
-            else:
-                new_text = find_printable_text(new_text)
+            else:                                                        # 截断/多字节未拼完
+                new_text = find_printable_text(new_text)                # 它会将乱码部分砍掉，只保留前面已经打印完整的部分
                 output_str = s.decoded_str + new_text
-
-            incremental_output = output_str[s.sent_offset :]
+            # 利用 sent_offset（已经发送给客户端的字符长度）从 output_str 中切片，得到本次真正需要发往客户端的新字符串
+            incremental_output = output_str[s.sent_offset :]            # 截取增量
             s.sent_offset = len(output_str)
             incremental_strs.append(incremental_output)
             if msg.finished:
