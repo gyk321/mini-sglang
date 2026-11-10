@@ -98,22 +98,22 @@ class ModelList(BaseModel):
 
 @dataclass
 class FrontendManager:
-    config: ServerArgs
-    send_tokenizer: ZmqAsyncPushQueue[BaseTokenizerMsg]
-    recv_tokenizer: ZmqAsyncPullQueue[BaseFrontendMsg]
-    uid_counter: int = 0
-    initialized: bool = False
-    ack_map: Dict[int, List[UserReply]] = field(default_factory=dict)
-    event_map: Dict[int, asyncio.Event] = field(default_factory=dict)
+    config: ServerArgs          # 保存全局的服务器配置信息
+    send_tokenizer: ZmqAsyncPushQueue[BaseTokenizerMsg]     # 异步发送队列，用于向后端 Tokenizer 进程推送请求消息
+    recv_tokenizer: ZmqAsyncPullQueue[BaseFrontendMsg]      # 异步接收队列，用于从后端 Tokenizer 进程拉取响应消息
+    uid_counter: int = 0        # 自增计数器，用于为每个新进入的用户请求分配全局唯一的 ID
+    initialized: bool = False   # 标记后台监听协程 (listen) 是否已经启动
+    ack_map: Dict[int, List[UserReply]] = field(default_factory=dict)   # 响应暂存字典，将每个请求的 uid 映射到其待消费的生成结果列表
+    event_map: Dict[int, asyncio.Event] = field(default_factory=dict)   # 事件映射字典，将每个请求的 uid 映射到其对应的 asyncio.Event 对象，用于协程间的同步与唤醒
 
     def new_user(self) -> int:
-        uid = self.uid_counter
+        uid = self.uid_counter      # 分配并返回一个新的 uid
         self.uid_counter += 1
         self.ack_map[uid] = []
         self.event_map[uid] = asyncio.Event()
         return uid
-    # 后台常驻消息分发器
-    async def listen(self):
+
+    async def listen(self):                             # 后台常驻的无限循环协程
         while True:
             msg = await self.recv_tokenizer.get()       # 从异步 ZMQ Pull 队列（ZmqAsyncPullQueue）中拉取后端发回的消息
             for msg in _unwrap_msg(msg):                # 解包消息
@@ -122,7 +122,7 @@ class FrontendManager:
                 self.ack_map[msg.uid].append(msg)       # 将属于该 uid 的增量输出（UserReply）追加到该用户专属的缓冲列表中
                 self.event_map[msg.uid].set()           # 事件唤醒，唤醒在等这个结果的协程
 
-    def _create_listener_once(self):
+    def _create_listener_once(self):            # 惰性启动机制
         if not self.initialized:                # 确保后台接收协程已经就绪
             asyncio.create_task(self.listen())
             self.initialized = True
@@ -131,25 +131,25 @@ class FrontendManager:
         self._create_listener_once()
         await self.send_tokenizer.put(msg)      # 将消息放入异步 ZMQ Push 队列（ZmqAsyncPushQueue），非阻塞地发送给后端进程
 
-    async def wait_for_ack(self, uid: int):
+    async def wait_for_ack(self, uid: int):     # 核心异步生成器
         event = self.event_map[uid]
 
         while True:
-            await event.wait()
-            event.clear()
+            await event.wait()                  # 挂起当前请求协程，等待listen()协程中event_map[msg.uid].set()唤醒（即后端返回了新的增量输出）
+            event.clear()                       # 将状态重置回 False, 以便下一次等待新的增量输出时可以再次挂起
 
-            pending = self.ack_map[uid]
+            pending = self.ack_map[uid]         # 取走刚刚 listen 放进去的数据
             self.ack_map[uid] = []
             ack = None
             for ack in pending:
-                yield ack
+                yield ack                       # 将增量输出（UserReply）逐个 yield 给调用者，供其处理或返回给前端（按下暂停键并递出物品）
             if ack and ack.finished:
                 break
 
         del self.ack_map[uid]
         del self.event_map[uid]
 
-    async def stream_generate(self, uid: int):
+    async def stream_generate(self, uid: int):  # 面向 /generate 接口和交互式 Shell 的流式生成器
         async for ack in self.wait_for_ack(uid):
             yield f"data: {ack.incremental_output}\n".encode()
             if ack.finished:
@@ -157,7 +157,7 @@ class FrontendManager:
         yield "data: [DONE]\n".encode()
         logger.debug("Finished streaming response for user %s", uid)
 
-    async def stream_chat_completions(self, uid: int):
+    async def stream_chat_completions(self, uid: int):  # OpenAI 兼容流式生成器
         first_chunk = True
         async for ack in self.wait_for_ack(uid):
             delta = {}
@@ -187,11 +187,11 @@ class FrontendManager:
         yield b"data: [DONE]\n\n"
         logger.debug("Finished streaming response for user %s", uid)
 
-    async def stream_with_cancellation(self, generator, request: Request, uid: int):
+    async def stream_with_cancellation(self, generator, request: Request, uid: int):    # 客户端断连检测包装器
         try:
             async for chunk in generator:
                 # detect if the client has disconnected
-                if await request.is_disconnected():
+                if await request.is_disconnected():     # 检查客户端是否断开连接
                     logger.info("Client disconnected for user %s", uid)
                     raise asyncio.CancelledError
                 yield chunk
@@ -199,7 +199,7 @@ class FrontendManager:
             asyncio.create_task(self.abort_user(uid))
             raise
 
-    async def abort_user(self, uid: int):
+    async def abort_user(self, uid: int):   # 请求中止与清理方法
         await asyncio.sleep(0.1)
         if uid in self.ack_map:
             del self.ack_map[uid]
@@ -207,8 +207,10 @@ class FrontendManager:
             del self.event_map[uid]
         logger.warning("Aborting request for user %s", uid)
         await self.send_one(AbortMsg(uid=uid))
-
-    def shutdown(self):
+        
+    # 停止 send_tokenizer 和 recv_tokenizer 两个 ZMQ 队列，
+    # 在 FastAPI 生命周期结束或 Shell 退出时调用
+    def shutdown(self):     
         self.send_tokenizer.stop()
         self.recv_tokenizer.stop()
 
@@ -410,7 +412,7 @@ async def shell():
         for child in parent.children(recursive=True):
             child.kill()
 
-
+# 启动前端 API 服务器，通过 ZeroMQ (ZMQ) 将前端与后端的 Tokenizer 进程连接起来
 def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_shell: bool) -> None:
     """
     Run the frontend API server (FastAPI + uvicorn) and wire it to the tokenizer process via ZMQ.
@@ -427,18 +429,18 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
     if run_shell:
         assert not config.use_dummy_weight, "Shell mode does not support dummy weights."
 
-    host = config.server_host
-    port = config.server_port
+    host = config.server_host   # 主机地址
+    port = config.server_port   # 端口号
 
-    assert _GLOBAL_STATE is None, "Global state is already initialized"
+    assert _GLOBAL_STATE is None, "Global state is already initialized" # 检查全局状态是否已经初始化，防止重复初始化
     _GLOBAL_STATE = FrontendManager(
         config=config,
-        recv_tokenizer=ZmqAsyncPullQueue(
+        recv_tokenizer=ZmqAsyncPullQueue(           # 接收来自后端的解码消息
             config.zmq_frontend_addr,
             create=True,
             decoder=BaseFrontendMsg.decoder,
         ),
-        send_tokenizer=ZmqAsyncPushQueue(
+        send_tokenizer=ZmqAsyncPushQueue(           # 发送给后端的编码消息
             config.zmq_tokenizer_addr,
             create=config.frontend_create_tokenizer_link,
             encoder=BaseTokenizerMsg.encoder,
@@ -446,7 +448,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
     )
 
     # start the backend here
-    start_backend()
+    start_backend()         # 启动后端工作进程（如张量并行调度器、分词器/解词器 Tokenizer/Detokenizer 等）
 
     logger.info(f"API server is ready to serve on {host}:{port}")
     if not run_shell:

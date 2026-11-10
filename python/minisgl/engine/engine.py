@@ -82,6 +82,7 @@ class Engine:
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)     # 采样器（Sampler）初始化
 
+        # ======================= Memory management initialization ========================
         post_free_memory = self._sync_get_memory()[0]                # 同步所有张量并行（TP）GPU、清空 PyTorch 缓存，并檢查多卡显存差值是否超过 2GB
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
 
