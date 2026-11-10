@@ -29,32 +29,32 @@ class ForwardOutput(NamedTuple):
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
-        set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
-        _adjust_config(config)
+        set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)     # 设置当前进程的张量并行（TP）Rank 和总大小
+        _adjust_config(config)                      # 自动选择最优的 Attention 后端
 
-        self.device = torch.device(f"cuda:{config.tp_info.rank}")
+        self.device = torch.device(f"cuda:{config.tp_info.rank}")           # 设备、流与全局上下文
         torch.cuda.set_device(self.device)
-        torch.manual_seed(42)
-        self.stream = torch.cuda.Stream()
-        torch.cuda.set_stream(self.stream)
+        torch.manual_seed(42)                       # 固定随机种子为 42
+        self.stream = torch.cuda.Stream()           
+        torch.cuda.set_stream(self.stream)          # 设为当前默认流
         self.dtype = config.dtype
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
 
-        self.tp_cpu_group = self._init_communication(config)
-        init_free_memory = self._sync_get_memory()[1]
+        self.tp_cpu_group = self._init_communication(config)        # 通信组初始化
+        init_free_memory = self._sync_get_memory()[1]               # 清空缓存、同步多卡状态，并获取所有 TP Rank 中的最大空闲显存
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
         # ======================= Model initialization ========================
-        set_rope_device(self.device)
+        set_rope_device(self.device)                                # 设置旋转位置编码设备
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
-        self.model.load_state_dict(self._load_weight_state_dict(config))
+        self.model.load_state_dict(self._load_weight_state_dict(config))        # 读取磁盘上的模型权重
 
         # ======================= KV cache initialization ========================
-        self.num_pages = self._determine_num_pages(init_free_memory, config)
-        num_tokens = self.num_pages * config.page_size
-        self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
+        self.num_pages = self._determine_num_pages(init_free_memory, config)    # 动态计算页数
+        num_tokens = self.num_pages * config.page_size                          # 分配物理显存池：计算总 Token 容量
+        self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(                # 分配显存池并挂载
             model_config=config.model_config,
             num_pages=self.num_pages + 1,  # +1 for dummy page
             page_size=config.page_size,
@@ -64,9 +64,9 @@ class Engine:
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
-        self.max_seq_len = min(config.max_seq_len, num_tokens)
-        aligned_max_seq_len = _align_up_32(self.max_seq_len)
-        self.ctx.page_table = self.page_table = torch.zeros(  # + 1 for dummy request
+        self.max_seq_len = min(config.max_seq_len, num_tokens)      # 约束最大序列长度
+        aligned_max_seq_len = _align_up_32(self.max_seq_len)        # 128 字节内存对齐
+        self.ctx.page_table = self.page_table = torch.zeros(  # + 1 for dummy request 分配页表张量
             (config.max_running_req + 1, aligned_max_seq_len),
             dtype=torch.int32,
             device=self.device,
@@ -80,9 +80,9 @@ class Engine:
             self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
 
         # ======================= Sampler initialization ========================
-        self.sampler = Sampler(self.device, config.model_config.vocab_size)
+        self.sampler = Sampler(self.device, config.model_config.vocab_size)     # 采样器（Sampler）初始化
 
-        post_free_memory = self._sync_get_memory()[0]
+        post_free_memory = self._sync_get_memory()[0]                # 同步所有张量并行（TP）GPU、清空 PyTorch 缓存，并檢查多卡显存差值是否超过 2GB
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
 
         # ======================= Graph capture initialization ========================

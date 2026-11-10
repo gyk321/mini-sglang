@@ -29,7 +29,7 @@ class SamplingParams:
 class Req:
     input_ids: torch.Tensor  # cpu tensor
     table_idx: int
-    cached_len: int
+    cached_len: int     # 前半段的长度
     output_len: int
     uid: int
     sampling_params: SamplingParams
@@ -37,7 +37,7 @@ class Req:
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
-        self.device_len = len(self.input_ids)
+        self.device_len = len(self.input_ids)       # 当前这轮要处理到的总长度
         self.max_device_len = len(self.input_ids) + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
 
@@ -46,10 +46,10 @@ class Req:
         return self.max_device_len - self.device_len
 
     @property
-    def extend_len(self) -> int:
+    def extend_len(self) -> int:                    # 后半段的长度，也就是这一轮真正要算 K/V 的 token 数
         return self.device_len - self.cached_len
 
-    def complete_one(self) -> None:
+    def complete_one(self) -> None:                 # 把刚处理完的部分划入已有 K/V，并给下一次生成的 token 留出一个位置
         self.cached_len = self.device_len
         self.device_len += 1
 

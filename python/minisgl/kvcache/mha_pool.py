@@ -16,25 +16,25 @@ class MHAKVCache(BaseKVCachePool):
     def __init__(
         self,
         num_kv_heads: int,
-        num_layers: int,
-        head_dim: int,
-        num_pages: int,
-        page_size: int,
+        num_layers: int,        # 按 Transformer 层隔离
+        head_dim: int,          # 每个头的向量维度
+        num_pages: int,         # 总物理块数
+        page_size: int,         # 每个块能容纳的 Token 数量
         dtype: torch.dtype,
         device: torch.device,
     ) -> None:
-        tp_info = get_tp_info()
-        local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
+        tp_info = get_tp_info()     # 获取当前进程所在的张量并行组信息
+        local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)     # 计算当前 GPU 实际需要管理的 KV 头数
         self._kv_buffer = torch.empty(
             (2, num_layers, num_pages, page_size, local_kv_heads, head_dim),
             device=device,
             dtype=dtype,
         )
         self._num_layers = num_layers
-        self._k_buffer = self._kv_buffer[0]
+        self._k_buffer = self._kv_buffer[0]     # 获取 Key 和 Value 的 5D 张量视图
         self._v_buffer = self._kv_buffer[1]
         self._device = device
-        self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
+        self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)         # 扁平化存储视图（Storage Shape）的预计算
 
     def k_cache(self, index: int) -> torch.Tensor:
         return self._k_buffer[index]
