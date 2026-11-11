@@ -65,27 +65,27 @@ class DecodeStatus:
 class DetokenizeManager:
     def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
         # uid -> DecodeStatus
-        self.decode_map: Dict[int, DecodeStatus] = {}
-        self.tokenizer = tokenizer
-        self.eos_token_id = self.tokenizer.eos_token_id
+        self.decode_map: Dict[int, DecodeStatus] = {}       # 跟踪每个并发请求的状态
+        self.tokenizer = tokenizer                          # HuggingFace 分词器，用于执行实际的解码操作
+        self.eos_token_id = self.tokenizer.eos_token_id     # 结束符 token 的 ID，用于判断序列是否结束
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
-        read_ids: List[List[int]] = []
-        surr_ids: List[List[int]] = []
+        read_ids: List[List[int]] = []              # 从 surr_offset 到最新的末尾，这是包含“已知前缀 + 新 token”的序列
+        surr_ids: List[List[int]] = []              # 从 surr_offset 到 read_offset，这纯粹是“已知前缀”的序列
         for msg in msgs:                            # 遍历传入的请求消息列表
             if msg.uid not in self.decode_map:      # 遇到新的请求
                 self.decode_map[msg.uid] = DecodeStatus(
-                    decoded_ids=[],
-                    decoded_str="",
-                    read_offset=0,
-                    surr_offset=0,
-                    sent_offset=0,
+                    decoded_ids=[],         # 该请求目前已解码的所有 token ID
+                    decoded_str="",         # 迄今累积的已确认、完全解码的文本
+                    read_offset=0,          # 已经确认解码为完整字符/单词的 token 索引。
+                    surr_offset=0,          # 历史上下文索引（通常等于上一次的 read_offset）
+                    sent_offset=0,          # 已经发送/返回给用户的字符串长度，用于计算每次的增量输出
                 )
             s = self.decode_map[msg.uid]
-            if not (msg.finished and msg.next_token == self.eos_token_id):
-                s.decoded_ids.append(msg.next_token)
-            read_ids.append(s.decoded_ids[s.surr_offset :])                 # 当前待解码整体
-            surr_ids.append(s.decoded_ids[s.surr_offset : s.read_offset])   # 上下文前缀:代表已经确认解码成功的一小段历史 token
+            if not (msg.finished and msg.next_token == self.eos_token_id):  # 如果当前生成的不是结束符
+                s.decoded_ids.append(msg.next_token)                        # 把新的 next_token 加入到该请求的历史 token 列表中
+            read_ids.append(s.decoded_ids[s.surr_offset :])                 # 当前待解码整体,包含“最近已确认的安全上下文” + “刚生成的新 token”。
+            surr_ids.append(s.decoded_ids[s.surr_offset : s.read_offset])   # 上下文前缀:代表已经确认解码成功的一小段历史 token,只包含“最近已确认的安全上下文”（作为前缀基准）。
 
         # 利用 HuggingFace tokenizer 的 batch_decode，一次性将所有请求的 read_ids 和 surr_ids 转换为字符串
         read_texts = self.tokenizer.batch_decode(read_ids)
@@ -107,7 +107,7 @@ class DetokenizeManager:
                 output_str = s.decoded_str + new_text
             # 利用 sent_offset（已经发送给客户端的字符长度）从 output_str 中切片，得到本次真正需要发往客户端的新字符串
             incremental_output = output_str[s.sent_offset :]            # 截取增量
-            s.sent_offset = len(output_str)
+            s.sent_offset = len(output_str)                             # 更新 sent_offset 为下一次计算做准备
             incremental_strs.append(incremental_output)
             if msg.finished:
                 del self.decode_map[msg.uid]

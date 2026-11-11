@@ -176,34 +176,34 @@ class Scheduler(SchedulerIOMixin):
         self.send_result(reply)                         # 通过进程间通信将 reply 列表中的所有 DetokenizeMsg 批量发送给下游的 Detokenizer 进程进行文本解码与流式输出。
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
-        if isinstance(msg, BatchBackendMsg):
+        if isinstance(msg, BatchBackendMsg):            # 处理批量消息,通过递归的方式调用自身
             for msg in msg.data:
                 self._process_one_msg(msg)
-        elif isinstance(msg, ExitMsg):
+        elif isinstance(msg, ExitMsg):                  # 终止整个调度器
             raise KeyboardInterrupt
-        elif isinstance(msg, UserMsg):
+        elif isinstance(msg, UserMsg):                  # 一个新到达的用户文本生成请求
             logger.debug_rank0("Received user msg: %s", msg)
-            input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
-            max_output_len = max_seq_len - input_len
-            if max_output_len <= 0:
-                return logger.warning_rank0(
+            input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len    # 获取当前输入的 Token 长度,引擎支持的最大序列长度
+            max_output_len = max_seq_len - input_len    # 计算出该请求允许生成的最大输出长度
+            if max_output_len <= 0:                     # 输入的 Prompt 长度已经达到或超过了引擎的最大限制
+                return logger.warning_rank0(            # 记录一条警告日志并直接丢弃该请求
                     f"Input sequence length {input_len} exceeds {max_seq_len}, "
                     f"request {msg.uid} is dropped."
                 )
-            if msg.sampling_params.max_tokens > max_output_len:
-                msg.sampling_params.max_tokens = max_output_len
-                logger.warning_rank0(
+            if msg.sampling_params.max_tokens > max_output_len:     # 如果用户请求中指定的期望生成长度大于计算出的可用剩余长度
+                msg.sampling_params.max_tokens = max_output_len     # 强制将其缩小至 max_output_len 以防止显存溢出
+                logger.warning_rank0(                               # 打印警告日志
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
-            self.prefill_manager.add_one_req(msg)
-        elif isinstance(msg, AbortBackendMsg):
-            logger.debug_rank0("Aborting request %d", msg.uid)
-            req_to_free = self.prefill_manager.abort_req(msg.uid)
-            req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
-            if req_to_free is not None:
+            self.prefill_manager.add_one_req(msg)                   # 将该消息作为新请求加入到 prefill_manager（预填充阶段管理器）的等待队列中，等待后续调度执行
+        elif isinstance(msg, AbortBackendMsg):                      # 客户端主动取消某个请求，或者请求因异常需要被终止
+            logger.debug_rank0("Aborting request %d", msg.uid)      # 打印调试日志
+            req_to_free = self.prefill_manager.abort_req(msg.uid)   # 根据消息提供的唯一标识符 msg.uid，首先尝试从 prefill_manager 中将其移除
+            req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid) # 如果在 prefill_manager 中未找到该请求，则继续尝试从 decode_manager 中将其移除
+            if req_to_free is not None:                             # 如果找到了该请求对象，则调用 _free_req_resources 方法释放其占用的资源（如页表槽位和 KV Cache）
                 self._free_req_resources(req_to_free)
-        else:
-            logger.error(f"Unknown message type: {type(msg)}")
+        else:                                                       # 如果收到的消息类型不在上述已知类型中，则记录一条错误日志并抛出 NotImplementedError 异常，提示该消息类型尚未被处理
+            logger.error(f"Unknown message type: {type(msg)}")      # 记录错误日志，显示未知消息类型
             raise NotImplementedError
 
     def _free_req_resources(self, req: Req) -> None:
