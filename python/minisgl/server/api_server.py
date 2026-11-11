@@ -215,10 +215,10 @@ class FrontendManager:
         self.recv_tokenizer.stop()
 
 
-@asynccontextmanager
+@asynccontextmanager        # 将一个生成器函数（包含 yield 的函数）转换为一个异步的上下文管理器
 async def lifespan(_: FastAPI):
     yield
-    # shutdown code here
+    # shutdown code here 在 FastAPI 服务器准备关闭时执行
     global _GLOBAL_STATE
     if _GLOBAL_STATE is not None:
         _GLOBAL_STATE.shutdown()
@@ -227,16 +227,16 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="MiniSGL API Server", version="0.0.1", lifespan=lifespan)
 
 
-@app.post("/generate")
+@app.post("/generate")      # 用来处理路径为 /generate 的 HTTP POST 请求
 async def generate(req: GenerateRequest, request: Request):
     logger.debug("Received generate request %s", req)
-    state = get_global_state()
-    uid = state.new_user()
+    state = get_global_state()  # 获取全局的 FrontendManager 实例，负责管理与后端（Tokenizer/推理引擎）的 ZeroMQ 异步通信以及管理当前所有活跃的请求
+    uid = state.new_user()      # 为当前这个生成请求分配一个全局唯一的 ID
     await state.send_one(
-        TokenizeMsg(
+        TokenizeMsg(            # 将用户的请求打包成系统内部通信的“分词消息”
             uid=uid,
             text=req.prompt,
-            sampling_params=SamplingParams(
+            sampling_params=SamplingParams(     # 采样参数
                 ignore_eos=req.ignore_eos,
                 max_tokens=req.max_tokens,
             ),
@@ -245,10 +245,10 @@ async def generate(req: GenerateRequest, request: Request):
 
     return StreamingResponse(
         state.stream_with_cancellation(state.stream_generate(uid), request, uid),
-        media_type="text/event-stream",
+        media_type="text/event-stream",         # 打字机般“流式”推给客户端
     )
 
-
+# FastAPI 中的一个“健康检查”或“基础路径探测”接口。它的主要作用是告诉客户端或监控系统：“API 的 v1 版本当前在线，并且运行正常”。
 @app.api_route("/v1", methods=["GET", "POST", "HEAD", "OPTIONS"])
 async def v1_root():
     return {"status": "ok"}
@@ -315,19 +315,21 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     }
 
 
-@app.get("/v1/models")
+@app.get("/v1/models")      # 用于列出当前可用的模型列表
 async def available_models():
     state = get_global_state()
+    # 启动服务器时通过命令行传入的模型路径或名称      
     return ModelList(data=[ModelCard(id=state.config.model_path, root=state.config.model_path)])
 
 
 async def shell_completion(req: OpenAICompletionRequest):
     state = get_global_state()
     assert req.messages is not None, "Shell completion only supports chat-completions"
-    prompt = [msg.model_dump() for msg in req.messages]
+    prompt = [msg.model_dump() for msg in req.messages]     # 将 Pydantic 的 Message 对象列表转换为标准的 Python 字典列表
 
     # TODO: support more sampling parameters
-    uid = state.new_user()
+    uid = state.new_user()          # 为当前的 Shell 回复任务生成一个全局唯一的 ID
+    # 将提取出的对话上下文以及采样参数封装成 TokenizeMsg 消息，通过 ZeroMQ 异步推送到后台，唤醒 GPU 开始推理。
     await state.send_one(
         TokenizeMsg(
             uid=uid,
@@ -342,10 +344,10 @@ async def shell_completion(req: OpenAICompletionRequest):
         )
     )
 
-    async def _abort():
-        await state.abort_user(uid)
+    async def _abort():                 # Shell 模式在生成过程中被强行中断或者生成结束时
+        await state.abort_user(uid)     # 向后台发送一条 AbortMsg 消息，终止对应 uid 的计算，释放 GPU 资源
 
-    return StreamingResponse(
+    return StreamingResponse(           # 返回流式响应对象
         state.stream_generate(uid),
         media_type="text/event-stream",
         background=BackgroundTask(lambda: _abort),
@@ -355,13 +357,13 @@ async def shell_completion(req: OpenAICompletionRequest):
 
 async def shell():
     commands = ["/exit", "/reset"]
-    completer = WordCompleter(commands)
-    session = PromptSession("$ ", completer=completer)
+    completer = WordCompleter(commands)                     # 注册了两个内置命令。当用户在终端输入 / 时，按下 Tab 键可以自动补全
+    session = PromptSession("$ ", completer=completer)      # 创建了一个交互式会话，终端的输入提示符被设置为 $。
 
     try:
-        history: List[Tuple[str, str]] = []
+        history: List[Tuple[str, str]] = []                 # 用来保存多轮对话历史的列表
         while True:
-            cmd = (await session.prompt_async()).strip()
+            cmd = (await session.prompt_async()).strip()    # 异步等待用户在终端输入内容
             if cmd == "":
                 continue
             if cmd.startswith("/"):
@@ -371,11 +373,14 @@ async def shell():
                     history = []
                     continue
                 raise ValueError(f"Unknown command: {cmd}")
+            
+            # 将历史对话转换为 Message 对象列表
             history_messages: List[Message] = []
             for user_msg, assistant_msg in history:
                 history_messages.append(Message(role="user", content=user_msg))
                 history_messages.append(Message(role="assistant", content=assistant_msg))
             # send to server
+            # 将历史记录加上用户当前的新输入 cmd，一并打包进 OpenAICompletionRequest 请求体中
             req = OpenAICompletionRequest(
                 model="",
                 messages=history_messages + [Message(role="user", content=cmd)],
@@ -385,29 +390,37 @@ async def shell():
                 temperature=ENV.SHELL_TEMPERATURE.value,
                 stream=True,
             )
+
+            # 消费流式数据并实现“打字机”效果
             cur_msg = ""
             async for chunk in (await shell_completion(req)).body_iterator:
                 msg = chunk.decode()  # type: ignore
                 assert msg.startswith("data: "), msg
+
+                # 手动解析 SSE 协议
                 msg = msg[6:]
                 assert msg.endswith("\n"), msg
                 msg = msg[:-1]
                 if msg == "[DONE]":
                     continue
                 cur_msg += msg
+                # 保证每次打印不自动换行，flush=True 强制立刻刷新屏幕缓冲区。
+                # 这样就能在终端里看到模型一个字一个字蹦出来的效果
                 print(msg, end="", flush=True)
             print("", flush=True)
+            # 生成结束后，把这一轮的用户输入和模型完整回复拼接存入 history，供下一轮对话使用
             history.append((cmd, cur_msg))
+    # 异常捕获与彻底的资源清理
     except EOFError:
         # user pressed Ctrl-D
         pass
     finally:
         print("Exiting shell...")
         await asyncio.sleep(0.1)
-        get_global_state().shutdown()
+        get_global_state().shutdown()       # 停止与后台通信的 ZMQ 队列
         # then kill all the subprocesses
         import psutil
-
+        # 清理僵尸进程：归查找并强制 kill() 当前进程产生的所有子进程，确保干干净净地退出
         parent = psutil.Process()
         for child in parent.children(recursive=True):
             child.kill()
@@ -448,6 +461,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
     )
 
     # start the backend here
+    # 实际上执行的就是 start_subprocess()
     start_backend()         # 启动后端工作进程（如张量并行调度器、分词器/解词器 Tokenizer/Detokenizer 等）
 
     logger.info(f"API server is ready to serve on {host}:{port}")
