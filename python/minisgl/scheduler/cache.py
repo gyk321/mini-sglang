@@ -78,20 +78,20 @@ class CacheManager:
             req.cache_handle = new_handle               # 还在自回归生成中，需要保留这部分尾部显存供下一次 Decode 使用
             self.lock(new_handle)
 
-    def check_integrity(self) -> None:
-        self.prefix_cache.check_integrity()
-        cache_pages = self.prefix_cache.size_info.total_size // self.page_size
-        if len(self.free_slots) + cache_pages != self.num_pages:
+    def check_integrity(self) -> None:              # 检查 CacheManager 的完整性，确保 free_slots 与 prefix_cache 的状态一致，避免内存泄漏或重复分配
+        self.prefix_cache.check_integrity()         # 检查前缀缓存的完整性，确保其内部状态一致
+        cache_pages = self.prefix_cache.size_info.total_size // self.page_size  # 计算前缀缓存中已使用的页数
+        if len(self.free_slots) + cache_pages != self.num_pages:            # 检查当前空闲页数与前缀缓存已使用页数之和是否等于总页数
             raise RuntimeError(
                 "CacheManager integrity check failed:"
                 f" free_pages({len(self.free_slots)}) +"
                 f" cache_pages({cache_pages}) != num_pages({self.num_pages})"
             )
-        if self.page_size > 1:
+        if self.page_size > 1:                      # 如果每页大小大于 1，则检查所有空闲页的起始索引是否是 page_size 的整数倍，确保页对齐
             assert torch.all(self.free_slots % self.page_size == 0)
 
     @contextmanager
-    def lazy_free_region(self):
+    def lazy_free_region(self):                     # 上下文管理器，用于在一个代码块中延迟释放物理页，避免在循环或批处理过程中频繁地进行显存回收操作，从而提高性能
         def lazy_free(indices: torch.Tensor) -> None:
             lazy_free_list.append(indices[:: self.page_size])
 

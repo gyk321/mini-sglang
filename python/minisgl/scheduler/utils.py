@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class PendingReq:
+class PendingReq:           # 表示一个待调度的请求（Pending Request），包含请求的唯一标识符、输入数据、采样参数以及可选的分块请求信息
     uid: int
     input_ids: torch.Tensor
     sampling_params: SamplingParams
