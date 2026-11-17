@@ -55,7 +55,7 @@ def launch_server(run_shell: bool = False) -> None:
         # a multiprocessing queue to receive ack from subprocesses
         # so that we can guarantee all subprocesses are ready
         ack_queue: mp.Queue[str] = mp.Queue()       # 多进程队列，用于接收各个子进程准备就绪的确认信号
-
+        # 派生 N 个 Scheduler 进程
         for i in range(world_size):                 # 根据张量并行（Tensor Parallelism）的配置大小，循环启动多个调度器进程
             new_args = replace(
                 server_args,
@@ -70,7 +70,7 @@ def launch_server(run_shell: bool = False) -> None:
 
         num_tokenizers = server_args.num_tokenizer
         # 启动反词元化器 
-        # DeTokenizer, only 1
+        # 派生 1 个 Detokenizer 进程
         mp.Process(
             target=tokenize_worker,
             kwargs={
@@ -87,12 +87,13 @@ def launch_server(run_shell: bool = False) -> None:
             name="minisgl-detokenizer-0",
         ).start()
         # 启动词元化器
+        # 派生 M 个 Tokenizer 进程 (默认与 Detokenizer 共享进程)
         for i in range(num_tokenizers):
             mp.Process(
                 target=tokenize_worker,
                 kwargs={
                     "tokenizer_path": server_args.model_path,
-                    "addr": server_args.zmq_tokenizer_addr,
+                    "addr": server_args.zmq_tokenizer_addr,         # 为每一个派生出的 Tokenizer Worker 分配一个独立的本地 ipc://（或 tcp://）端点地址列表
                     "backend_addr": server_args.zmq_backend_addr,
                     "frontend_addr": server_args.zmq_frontend_addr,
                     "local_bs": 1,

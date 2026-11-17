@@ -97,7 +97,7 @@ class Scheduler(SchedulerIOMixin):
             or self.prefill_manager.runnable        # 有待执行的 Prefill 请求
             or self.decode_manager.runnable         # 有待执行的 Decode 请求
         )
-        for msg in self.receive_msg(blocking=blocking):
+        for msg in self.receive_msg(blocking=blocking): # 拉取外部消息
             self._process_one_msg(msg)
 
         forward_input = self._schedule_next_batch()
