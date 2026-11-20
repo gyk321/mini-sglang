@@ -74,14 +74,15 @@ def mem_GB(size: int) -> str:
 def get_free_memory(device: torch.device) -> int:
     return torch.cuda.mem_get_info(device)[0]
 
-
+# 管理 CUDA Graph 捕获（Capture）与重放（Replay） 的核心类。
+# 它的主要作用是在大语言模型的 Decode（解码）阶段 消除频繁的 Python/CPU 算子启动开销，从而显著提升推理吞吐和降低延迟
 class GraphRunner:
     def __init__(
         self,
         stream: torch.cuda.Stream,
         device: torch.device,
         model: BaseLLMModel,
-        attn_backend: BaseAttnBackend,
+        attn_backend: BaseAttnBackend,      # 注意力后端
         cuda_graph_bs: List[int] | None,
         cuda_graph_max_bs: int | None,
         free_memory: int,
@@ -147,6 +148,7 @@ class GraphRunner:
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
+        # 检查当前批次是否处于 Decode（解码）阶段并且实际请求数量没有超过捕获的最大图尺寸
         return batch.is_decode and batch.size <= self.max_graph_bs
 
     def replay(self, batch: Batch) -> torch.Tensor:
@@ -158,11 +160,13 @@ class GraphRunner:
         return self.buffer.logits[: batch.size]
 
     def pad_batch(self, batch: Batch) -> None:
+        # 找到第一个大于或等于当前 batch.size 的尺寸作为目标大小 padded_size
         padded_size = (  # choose the first available batch size
             next(bs for bs in self.graph_bs_list if bs >= batch.size)
-            if self.can_use_cuda_graph(batch)
+            if self.can_use_cuda_graph(batch)       # 判断是否可以使用 CUDA Graph
             else batch.size
         )
+        # 使用初始化时传入的占位请求 self.dummy_req 复制相应次数  |  计算需要补齐的空位数量
         batch.padded_reqs = batch.reqs + [self.dummy_req] * (padded_size - batch.size)
 
     # NOTE: This must be called before freeing NCCL resources to prevent program hang

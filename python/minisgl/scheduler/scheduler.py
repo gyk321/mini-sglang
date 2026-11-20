@@ -242,36 +242,42 @@ class Scheduler(SchedulerIOMixin):
         self.decode_manager.filter_reqs(forward_input.batch.reqs)           # 更新解码队列
         return forward_output
 
-
+# 为模型前向传播构建位置编码索引的辅助函数
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
-    needed_size = sum(r.extend_len for r in batch.padded_reqs)
-    indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
+    needed_size = sum(r.extend_len for r in batch.padded_reqs)                  # 当前请求在本次前向传播中需要新处理的 token 长度
+    indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True) # 设置 pin_memory=True 分配锁页内存
     offset = 0
+    # 把当前批次（Batch）中每个请求本次新处理的 token，
+    # 按照顺序生成它们各自在序列中的“绝对位置编号”，并紧凑地拼接到一个一维大数组 indices_host 中
     for req in batch.padded_reqs:
         length = req.extend_len
         torch.arange(
-            req.cached_len,
-            req.device_len,
+            req.cached_len,         # 已经存在于 KV Cache 中的历史 token 长度
+            req.device_len,         # 本次新处理的 token 后的总长度（即 req.cached_len + req.extend_len）
             dtype=torch.int32,
             out=indices_host[offset : offset + length],
         )
         offset += length
     return indices_host.to(device, non_blocking=True)
 
-
+# 为当前批次（Batch）中展平后的每一个待处理 token，构建用于从全局显存池中“查表取值”的二维坐标索引
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
     mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
+        # 将当前请求的 table_idx 连续复制填充 length 次，与 batch.positions 中的序列位置一一对齐
         mapping_host[offset : offset + length].fill_(req.table_idx)
         offset += length
     return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)
 
-
+# 为当前批次（Batch）生成二维索引映射，用于将模型前向传播采样得到的新 Token 精确写入 GPU 的 token_pool（Token 缓冲池）中
 def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
-    mapping_list = [req.table_idx for req in batch.reqs]
-    mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
+    # 提取请求在缓冲池中的行索引
+    mapping_list = [req.table_idx for req in batch.reqs]                                # TableManager 为该请求分配的全局唯一槽位编号
+    mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)       # 转为 torch.int64 类型
+    # 计算新 Token 的写入列位置
+    # req.device_len，即当前设备端序列的长度，正好对应追加下一个新 token 的末尾位置
     write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
     write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
     return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)
